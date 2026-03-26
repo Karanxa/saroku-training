@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+.env
+models/saroku-safety-0.5b/checkpoints/
+
+# model weights — stored on HuggingFace (karanxa/saroku-safety-0.5b)
+models/
