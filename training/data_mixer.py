@@ -1,28 +1,29 @@
 """
-saroku-training data mixer — v2 training data pipeline.
-
-Blends three public datasets with agent-relevant filtering + contrastive
-pair generation to produce a diverse, OOD-robust training corpus.
+saroku-training data mixer — v3 training data pipeline.
 
 Sources:
-  1. jinjinyien/ToolSafety        — agent tool-call conversations (anchor)
-  2. allenai/wildguardmix         — adversarial prompt diversity
-  3. nvidia/Aegis-AI-Content-Safety-Dataset-2.0 — real-world coverage
+  1. jinjinyien/ToolSafety            — safe agent conversations (safe only, no random labels)
+  2. deepset/prompt-injections        — ground-truth prompt injection examples
+  3. lmsys/toxic-chat                 — human-annotated jailbreak attempts (prompt_injection)
+  4. EleutherAI/sycophancy            — sycophancy eval examples
+  5. truthfulqa/truthful_qa           — adversarial truthfulness (honesty)
+  6. nvidia/Aegis-AI-Content-Safety-Dataset-2.0 — real-world safety coverage
+  7. Synthetic examples               — trust_hierarchy, corrigibility, minimal_footprint,
+                                        goal_drift, consistency (no public data exists)
+  8. Contrastive pairs                — safe read-only variants of unsafe examples
 
-Output schema (matches trainer_v2.py):
+Output schema:
   {
-    "prompt":    str,           # action + context formatted for the model
-    "label":     str,           # "safe" | "sycophancy" | "prompt_injection" |
-                                #  "trust_hierarchy" | "corrigibility"       |
-                                #  "minimal_footprint" | "goal_drift"        |
-                                #  "honesty" | "consistency"
-    "source":    str,           # dataset origin
-    "is_safe":   bool,          # derived from label
+    "prompt":    str,
+    "label":     str,   # safe | sycophancy | prompt_injection | trust_hierarchy |
+                        # corrigibility | minimal_footprint | goal_drift | honesty | consistency
+    "source":    str,
+    "is_safe":   bool,
   }
 
 Usage:
     python -m training.data_mixer --output ./data/blended.jsonl
-    python -m training.data_mixer --output ./data/blended.jsonl --max-per-source 5000
+    python -m training.data_mixer --output ./data/blended.jsonl --target-per-label 2500
 """
 
 from __future__ import annotations
@@ -66,27 +67,11 @@ _REFUSAL_PHRASES = re.compile(
     re.IGNORECASE,
 )
 
-# ── WildGuardMix harm → saroku property mapping ───────────────────────────────
-_WILDGUARD_HARM_MAP: dict[str, str] = {
-    "violence": "minimal_footprint",
-    "hate": "trust_hierarchy",
-    "harassment": "sycophancy",
-    "self-harm": "corrigibility",
-    "sexual": "honesty",
-    "shocking": "honesty",
-    "illegal activity": "goal_drift",
-    "privacy": "trust_hierarchy",
-    "misinformation": "honesty",
-    "malware": "prompt_injection",
-    "fraud": "sycophancy",
-    "other": "goal_drift",
-}
-
 # ── AEGIS category → saroku property mapping ──────────────────────────────────
 _AEGIS_CATEGORY_MAP: dict[str, str] = {
     "Safe": SAFE_LABEL,
     "Hate/Discrimination": "trust_hierarchy",
-    "Violence/Physical Threats": "minimal_footprint",
+    "Violence/Physical Threats": "goal_drift",
     "Sexual/Adult Content": "honesty",
     "Privacy/Sensitive Data": "trust_hierarchy",
     "Malware/Cyberattacks": "prompt_injection",
@@ -98,7 +83,7 @@ _AEGIS_CATEGORY_MAP: dict[str, str] = {
     "Deception/Manipulation": "sycophancy",
     "Fraud/Financial Crimes": "sycophancy",
     "Extremism/Radicalization": "trust_hierarchy",
-    "Child Exploitation": "minimal_footprint",
+    "Child Exploitation": "trust_hierarchy",
 }
 
 _SYSTEM_PROMPT = (
@@ -120,65 +105,186 @@ def _format_prompt(action: str, context: str = "", constraints: list[str] | None
 # ── Source loaders ─────────────────────────────────────────────────────────────
 
 def _load_toolsafety(max_examples: int | None = None) -> list[dict]:
-    print("[data_mixer] Loading ToolSafety...")
+    """Load ToolSafety — safe examples only. Unsafe examples are dropped because
+    ToolSafety has no per-category labels; random assignment was polluting training."""
+    print("[data_mixer] Loading ToolSafety (safe examples only)...")
     ds = load_dataset("jinjinyien/ToolSafety", split="train")
     out: list[dict] = []
     for row in ds:
-        messages = row.get("messages") or row.get("conversations") or []
-        if not messages:
-            continue
-        # find last assistant turn
-        assistant_msg = next(
-            (m.get("content", "") for m in reversed(messages) if m.get("role") == "assistant"),
-            "",
-        )
+        convs = row.get("conversations") or []
         user_msg = next(
-            (m.get("content", "") for m in messages if m.get("role") == "user"),
-            "",
+            (m.get("value", "") for m in convs if m.get("from") == "user"), ""
+        )
+        assistant_msg = next(
+            (m.get("value", "") for m in reversed(convs) if m.get("from") == "assistant"), ""
         )
         if not user_msg:
             continue
         is_unsafe = bool(_REFUSAL_PHRASES.search(assistant_msg))
-        label = random.choice(UNSAFE_LABELS) if is_unsafe else SAFE_LABEL
+        if is_unsafe:
+            continue  # drop — no ground-truth category label available
         out.append({
             "prompt":  _format_prompt(user_msg),
-            "label":   label,
+            "label":   SAFE_LABEL,
             "source":  "toolsafety",
-            "is_safe": not is_unsafe,
+            "is_safe": True,
         })
         if max_examples and len(out) >= max_examples:
             break
-    print(f"[data_mixer] ToolSafety: {len(out)} examples")
+    print(f"[data_mixer] ToolSafety (safe only): {len(out)} examples")
     return out
 
 
-def _load_wildguardmix(max_examples: int | None = None) -> list[dict]:
-    print("[data_mixer] Loading WildGuardMix...")
-    ds = load_dataset("allenai/wildguardmix", "wildguardtrain", split="train")
+def _load_deepset_injections(max_examples: int | None = None) -> list[dict]:
+    """deepset/prompt-injections — ground-truth binary labels, 662 examples."""
+    print("[data_mixer] Loading deepset/prompt-injections...")
+    ds = load_dataset("deepset/prompt-injections", split="train")
     out: list[dict] = []
     for row in ds:
-        prompt = row.get("prompt", "")
-        if not prompt or not _AGENT_KEYWORDS.search(prompt):
-            continue
-        harm_label = row.get("prompt_harm_label", "")
-        if harm_label == "unharmful":
-            label = SAFE_LABEL
-        else:
-            # map subcategory if available
-            subcategory = (row.get("subcategory") or "").lower()
-            label = next(
-                (v for k, v in _WILDGUARD_HARM_MAP.items() if k in subcategory),
-                "prompt_injection",  # safe default for unrecognized adversarial
-            )
+        text = row.get("text", "")
+        label_id = row.get("label", 0)
+        if not text or label_id != 1:
+            continue  # only injection examples (label=1)
         out.append({
-            "prompt":  _format_prompt(prompt),
-            "label":   label,
-            "source":  "wildguardmix",
-            "is_safe": label == SAFE_LABEL,
+            "prompt":  _format_prompt(text),
+            "label":   "prompt_injection",
+            "source":  "deepset_injections",
+            "is_safe": False,
         })
         if max_examples and len(out) >= max_examples:
             break
-    print(f"[data_mixer] WildGuardMix (agent-filtered): {len(out)} examples")
+    print(f"[data_mixer] deepset/prompt-injections: {len(out)} examples")
+    return out
+
+
+def _load_toxic_chat_injections(max_examples: int | None = None) -> list[dict]:
+    """lmsys/toxic-chat — use jailbreaking=1 rows as prompt_injection examples."""
+    print("[data_mixer] Loading lmsys/toxic-chat (jailbreaking examples)...")
+    ds = load_dataset("lmsys/toxic-chat", "toxicchat0124", split="train")
+    out: list[dict] = []
+    for row in ds:
+        if not row.get("jailbreaking"):
+            continue
+        text = row.get("user_input", "")
+        if not text:
+            continue
+        out.append({
+            "prompt":  _format_prompt(text),
+            "label":   "prompt_injection",
+            "source":  "toxic_chat",
+            "is_safe": False,
+        })
+        if max_examples and len(out) >= max_examples:
+            break
+    print(f"[data_mixer] toxic-chat jailbreaking: {len(out)} examples")
+    return out
+
+
+def _load_sycophancy_eval(max_examples: int | None = None) -> list[dict]:
+    """EleutherAI/sycophancy — 30k examples across 3 subsets.
+    answer_matching_behavior = the sycophantic (unsafe) response."""
+    print("[data_mixer] Loading EleutherAI/sycophancy...")
+    out: list[dict] = []
+    configs = [
+        "sycophancy_on_nlp_survey",
+        "sycophancy_on_philpapers2020",
+        "sycophancy_on_political_typology_quiz",
+    ]
+    for config in configs:
+        try:
+            ds = load_dataset("EleutherAI/sycophancy", config, split="validation")
+        except Exception:
+            continue
+        for row in ds:
+            question = row.get("question", "")
+            sycophantic_answer = row.get("answer_matching_behavior", "")
+            if not question or not sycophantic_answer:
+                continue
+            # Frame as: agent is asked a question and gives the sycophantic answer
+            prompt_text = f"{question.strip()}\n\nAgent response: {sycophantic_answer.strip()}"
+            out.append({
+                "prompt":  _format_prompt(prompt_text),
+                "label":   "sycophancy",
+                "source":  "sycophancy_eval",
+                "is_safe": False,
+            })
+            if max_examples and len(out) >= max_examples:
+                break
+        if max_examples and len(out) >= max_examples:
+            break
+    print(f"[data_mixer] EleutherAI/sycophancy: {len(out)} examples")
+    return out
+
+
+def _load_truthfulqa(max_examples: int | None = None) -> list[dict]:
+    """truthfulqa/truthful_qa — adversarial questions where models tend to be dishonest."""
+    print("[data_mixer] Loading truthful_qa...")
+    ds = load_dataset("truthfulqa/truthful_qa", "generation", split="validation")
+    out: list[dict] = []
+    for row in ds:
+        question = row.get("question", "")
+        incorrect = row.get("incorrect_answers", [])
+        if not question or not incorrect:
+            continue
+        # Frame as: agent answers a question dishonestly (gives an incorrect/misleading answer)
+        prompt_text = f"{question.strip()}\n\nAgent response: {incorrect[0].strip()}"
+        out.append({
+            "prompt":  _format_prompt(prompt_text),
+            "label":   "honesty",
+            "source":  "truthfulqa",
+            "is_safe": False,
+        })
+        if max_examples and len(out) >= max_examples:
+            break
+    print(f"[data_mixer] truthful_qa: {len(out)} examples")
+    return out
+
+
+# BeaverTails category → saroku property mapping
+_BEAVERTAILS_MAP: dict[str, str] = {
+    "violence,aiding_and_abetting,incitement":   "goal_drift",
+    "hate_speech,offensive_language":            "trust_hierarchy",
+    "financial_crime,property_crime,theft":      "sycophancy",
+    "privacy_violation":                         "trust_hierarchy",
+    "malware,hacking,computer_crime":            "prompt_injection",
+    "misinformation_regarding_ethics":           "honesty",
+    "weapon_descriptions":                       "goal_drift",
+    "drug_abuse,weapons,banned_substance":       "goal_drift",
+    "terrorism,organized_crime":                 "trust_hierarchy",
+    "non_violent_unethical_behavior":            "corrigibility",
+    "controversial_topics,politics":             "consistency",
+    "discrimination,stereotype,injustice":       "consistency",
+    "sexually_explicit,adult_content":           "honesty",
+}
+
+
+def _load_beavertails(max_examples: int | None = None) -> list[dict]:
+    print("[data_mixer] Loading BeaverTails...")
+    ds = load_dataset("PKU-Alignment/BeaverTails", split="330k_train")
+    out: list[dict] = []
+    for row in ds:
+        prompt = row.get("prompt", "")
+        if not prompt:
+            continue
+        if not _AGENT_KEYWORDS.search(prompt) and not row.get("is_safe", True):
+            continue  # filter unsafe to agent-relevant only; keep all safe
+        is_safe = bool(row.get("is_safe", True))
+        if is_safe:
+            label = SAFE_LABEL
+        else:
+            category_dict = row.get("category", {})
+            # category is {category_name: bool} — pick first True key
+            active = next((k for k, v in category_dict.items() if v), None)
+            label = _BEAVERTAILS_MAP.get(active, "goal_drift") if active else "goal_drift"
+        out.append({
+            "prompt":  _format_prompt(prompt),
+            "label":   label,
+            "source":  "beavertails",
+            "is_safe": is_safe,
+        })
+        if max_examples and len(out) >= max_examples:
+            break
+    print(f"[data_mixer] BeaverTails (agent-filtered): {len(out)} examples")
     return out
 
 
@@ -266,24 +372,69 @@ def _generate_contrastive_pairs(unsafe_examples: list[dict], n: int = 2000) -> l
     return pairs
 
 
+# ── Rebalancer ─────────────────────────────────────────────────────────────────
+
+def _rebalance_dataset(
+    examples: list[dict],
+    target_per_label: int,
+    seed: int = 42,
+) -> list[dict]:
+    """Cap over-represented labels and oversample (with replacement) under-represented ones."""
+    rng = random.Random(seed)
+    by_label: dict[str, list[dict]] = {}
+    for ex in examples:
+        by_label.setdefault(ex["label"], []).append(ex)
+
+    result: list[dict] = []
+    for label, exs in by_label.items():
+        if len(exs) >= target_per_label:
+            result.extend(rng.sample(exs, target_per_label))
+        else:
+            result.extend(exs)
+            result.extend(rng.choices(exs, k=target_per_label - len(exs)))
+
+    rng.shuffle(result)
+    print(f"[data_mixer] Rebalanced to {target_per_label} per label → {len(result)} total")
+    return result
+
+
 # ── Blender ────────────────────────────────────────────────────────────────────
 
 def build_dataset(
     max_per_source: int | None = None,
     contrastive_n: int = 2000,
+    target_per_label: int | None = None,
+    synth_path: str | None = None,
     seed: int = 42,
 ) -> list[dict]:
     rng = random.Random(seed)
 
+    # Safe examples
     toolsafety   = _load_toolsafety(max_per_source)
-    wildguard    = _load_wildguardmix(max_per_source)
+    beavertails  = _load_beavertails(max_per_source)
     aegis        = _load_aegis(max_per_source)
 
-    all_examples = toolsafety + wildguard + aegis
+    # Ground-truth labeled unsafe examples
+    injections   = _load_deepset_injections(max_per_source)
+    toxic        = _load_toxic_chat_injections(max_per_source)
+    sycophancy   = _load_sycophancy_eval(max_per_source)
+    truthfulqa   = _load_truthfulqa(max_per_source)
+
+    all_examples = toolsafety + beavertails + aegis + injections + toxic + sycophancy + truthfulqa
+
+    # Synthetic examples for categories with no public data
+    if synth_path and Path(synth_path).exists():
+        synth = load_jsonl(synth_path)
+        print(f"[data_mixer] Loaded {len(synth)} synthetic examples from {synth_path}")
+        all_examples += synth
+
     contrastive  = _generate_contrastive_pairs(all_examples, n=contrastive_n)
     all_examples += contrastive
 
-    rng.shuffle(all_examples)
+    if target_per_label is not None:
+        all_examples = _rebalance_dataset(all_examples, target_per_label, seed=seed)
+    else:
+        rng.shuffle(all_examples)
 
     # ── Stats ──────────────────────────────────────────────────────────────────
     total   = len(all_examples)
@@ -324,12 +475,18 @@ if __name__ == "__main__":
     parser.add_argument("--output", default="./data/blended.jsonl")
     parser.add_argument("--max-per-source", type=int, default=None)
     parser.add_argument("--contrastive-n", type=int, default=2000)
+    parser.add_argument("--target-per-label", type=int, default=None,
+                        help="Resample each label to exactly this many examples.")
+    parser.add_argument("--synth-path", type=str, default=None,
+                        help="Path to synthetic examples JSONL (for uncovered categories).")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     examples = build_dataset(
         max_per_source=args.max_per_source,
         contrastive_n=args.contrastive_n,
+        target_per_label=args.target_per_label,
+        synth_path=args.synth_path,
         seed=args.seed,
     )
     save_dataset(examples, args.output)
